@@ -1,0 +1,421 @@
+/*
+ * Lab4.c
+ *
+ * Created: 4/10/2016 3:34:24 PM
+ *  Author: kkeane
+ */ 
+
+
+#include <stdio.h>
+#include <avr/io.h>
+#include <stdlib.h>
+#include <avr/interrupt.h>
+#define F_CPU 16000000UL
+#include <util/delay.h>
+#define BAUDRATE 19200
+#define BAUD_PRESCALLER (((F_CPU / (BAUDRATE * 16UL))) - 1)
+
+// Declaration of functions
+void timer2_init(void);
+void motor_forward(unsigned char voltage);
+void motor_reverse(unsigned char voltage);
+void motor_stop(void);
+void timer0_init(void);				// Function to initialize 8-bit timer
+void adc_init(void);				// Function to initialize/configure the ADC
+uint16_t read_adc(uint8_t channel);	// Function to read an arbitrary analogic channel/pin
+void USART_init(void);				// Function to initialize and configure the USART/serial
+static void uart_putchar(char c);	// Function to send character to computer
+void printfloat(float number);		// Function to send float to computer
+void Sensor_ENABLE(void);			// Function to enable Hall-effect sensor
+float calibrate(float volts);		// Function to convert voltage to angle
+float saturation(float angle);		// Function to correct discontinuities in angle
+
+// Variables
+volatile unsigned long tot_overflow=0;
+unsigned long now		= 0;
+uint8_t phase			= 1;
+uint16_t power			= 6;
+uint16_t adc_value;
+float buffer;
+float angle;
+float v;
+float oldangle			= 0;
+float dangle;
+float v2				= 0;
+float v3				= 0;
+float va				= 0;
+float va_old			= 0;
+float va2				= 0;
+float va3				= 0;
+float dt				= 0.001;
+
+float u_p				= 0;
+float u_sp				= 0;
+float u_v				= 0;
+float u_vis				= 0;
+float u_w1				= 0;
+float u_w2				= 0;
+float error				= 0;
+float error_prev		= 0;
+float error1			= 0;
+float error1_prev		= 0;
+float error2			= 0;
+float error2_prev		= 0;
+float error_dir			= 0;
+float u_vprev			= 0;
+float error_int			= 0;
+float ref_ang			= 0;
+float ref_ang_spring	= 0;
+float ref_v				= 0;
+float ref_wall			= 0;
+float ref_vis			= 0;
+uint8_t tol				= 3;
+uint8_t vtol			= 100;
+uint8_t DBoff			= 2;
+char pos_con			= 0;
+char wall_con			= 0;
+char v_con				= 0;
+char spring_con			= 0;
+char vis_con			= 0;
+
+//Position PD Gains
+// float kpp = 1.2;
+// float kdp = 0.002;
+
+//Position PD w/ Handle
+ float kpp	= 0.9;
+ float kdp	= 0.005;
+ 
+ //Spring PD w/ Handle
+ float kps	= 0.5*2;
+ float kds	= 0.5*0.01;
+
+//Velocity PID Gains
+float kpv	= 0.0005;
+float kiv	= 0.01;
+float kdv	= 0.0001;
+
+//Viscosity PID Gains
+float kpvis = 0.08;
+float kivis = 0.000;
+float kdvis = 0.001;
+
+//Spring PD w/ Handle
+float kpw	= 0.7*2;
+float kdw	= 0.5*0.01;
+
+
+// Main program
+int main(void){
+	// Set pins as outputs
+	DDRB |= ((1<<PORTB0)|(1<<PORTB3)|(1<<PORTB5));
+	TCCR2A = 0xF3;
+	OCR2A = 0;
+	// Initialize timer
+	timer2_init();
+	// Send Stuff
+	Sensor_ENABLE();	// Initialize Sensor power
+	adc_init();			// Setup the ADC
+	USART_init();       // Setup the USART
+	timer0_init();		// Initialize timer
+	while(1) {
+		if(tot_overflow-now >= 200){
+			now = tot_overflow;
+			if (phase==3){
+				phase=1;
+			}
+			if(phase==1){
+				ref_ang = -90;
+				ref_v = 1000;
+				ref_ang_spring = 0;
+				ref_vis = 0;
+			}
+			if(phase==2){
+				ref_ang = 90;
+				ref_v = -1000;
+				ref_ang_spring = 0;
+				ref_vis = 0;
+			}
+			phase++;
+		}
+		
+		//Send Values to PC
+		adc_value = read_adc(1);				// Read one ADC channel
+		buffer = adc_value;						// cast ADC value to float
+		angle = calibrate(buffer);				// convert voltage to angle
+		
+		
+		
+		if (TCNT0 >= 62){								// when clock count reaches value for 1 ms
+			TCNT0 =  0;									// reset clock
+			// Calculate angular velocity
+			dangle		= saturation(angle-oldangle);	// change in position
+			v			= dangle/dt;					// velocity
+			// Filter
+			va			= (.0055*v+.00111*v2+.0055*v3-(-1.7786)*va2-.8008*va3)/1;
+			//printfloat(va);
+			oldangle	= angle;
+			va3			= va2;
+			va2			= va;
+			v3			= v2;
+			v2			= v;
+		}
+		
+//   		//Position Control
+//   		
+//   		pos_con = 1;
+//   		error = (ref_ang - angle);
+//   		u_p = abs(kpp*error+kdp*(error-error_prev)/dt);	
+//   		printfloat(angle);	
+//   		if(pos_con==1){
+//   			if(error>5){
+//   				motor_forward(u_p);
+//   			}
+//   			else if(error<-5){
+//   				motor_reverse(u_p);
+//   			}
+//   			else {
+//   				motor_stop();
+//   			}
+//   		}
+//  		printfloat(angle);
+		
+// 		//Velocity Control
+// 		v_con = 1;
+// 		
+// 		error = (ref_v - va);
+//  		error_dir = (error-error_prev)/dt;
+//  		error_int = error_int +  error*dt;
+// 		//printfloat(va);
+//  		u_v = abs(kpv*error + kdv*error_dir + kiv*error_int);
+//  
+// 		//printfloat(u_v);
+//  		if(v_con==1){
+//  			if(ref_v>0){
+//  				motor_forward(u_v+63);
+//  			}
+//  
+//  			else if(ref_v<0){
+//  				motor_reverse(u_v+63);
+//  			}
+// 		}
+
+
+//  		//Spring Control
+//  		spring_con = 1;
+//  		error = (ref_ang_spring - angle);
+//  		u_sp = abs(kps*error+kds*(error-error_prev)/dt);
+//  		if(spring_con==1){
+// 	 		if(abs(error)>2*tol){
+// 				if (error>0){
+// 		 			motor_forward(u_sp+50);
+// 				}
+// 	 			if(error<0){
+// 		 			motor_reverse(u_sp+50);
+// 	 			}
+// 			}
+// 	 		if(abs(error)<2*tol) {
+// 		 		motor_stop();
+// 	 		}
+//  		}
+// 		printfloat(u_sp+50);
+		
+
+//  		//VIscocity Control
+//  		vis_con = 1;
+// 
+//  		error = (ref_vis - va);
+//   		error_dir = (error-error_prev)/dt;
+//   		error_int = error_int +  error*dt;
+//  		//printfloat(va);
+//   		u_vis = abs(kpvis*error + kdvis*error_dir + kivis*error_int);
+// 
+//  		//printfloat(u_v);
+//   		if(vis_con==1){
+// 			  if(abs(va)<200){
+// 				  motor_stop();
+// 			  }
+// 			  if(abs(va_old)<50){
+// 				  motor_stop();
+// 			  }
+// 			  if(va<-200){
+// 				  motor_forward(u_vis);	
+// 			  }
+// 			  if(va>200){
+// 				  motor_reverse(u_vis);
+// 			  }		  
+//  		}
+// 		printfloat(va);
+// 		va_old = va;
+
+  		//Virtual Wall
+  		
+  		wall_con = 1;
+  		error1	= (0 - angle);
+  		u_w1	= abs(kpw*error1+kdw*(error1-error1_prev)/dt);
+		error2	= (180 - angle);
+  		u_w2	= abs(kpw*error2+kdw*(error2-error2_prev)/dt);
+  		//printfloat(angle);
+  		if(wall_con==1){
+	  		if(((angle<=0) & (angle>=-180))|(angle==180)){
+// 		  		motor_forward(0);
+// 				motor_reverse(0);
+				motor_stop();
+	  		}
+	  		if((angle>0) & (angle<180)){
+				  if(angle<=90){
+					motor_reverse(u_w1+50);
+				  }
+				  if(angle>90){
+					motor_forward(u_w2+50);
+				  }
+	  		}
+  		}
+  		printfloat(u_w1);
+		error1_prev = error1;
+		error2_prev = error2;
+		
+				
+		error_prev = error;
+		
+	}
+
+	return 0;
+}
+
+// Initialize timer
+void timer0_init(void){
+	// set up timer with prescaler = 256
+	TCCR0B |= (1 << CS02);
+	// set up timer with prescaler = 64
+	//TCCR0B |= ((1 << CS00)|(1 << CS01));
+	// initialize counter
+	TCNT0 = 0;
+}
+// Initialize timer 2
+void timer2_init(void){
+	// prescaler 8
+	//TCCR2B = (1 << CS21);
+	// prescaler 32
+	//TCCR2B = (1 << CS21)|(1 << CS20);
+	// prescaler 64
+	//TCCR2B = (1 << CS22);
+	// prescaler 128
+	//TCCR2B = (1 << CS22)|(1 << CS20);
+	// prescaler 256
+	//TCCR2B = (1 << CS22)|(1 << CS21);
+	// prescaler 1024
+	TCCR2B = (1 << CS22)|(1 << CS21)|(1 << CS20);
+	
+	TCNT2 = 0;
+	
+	TIMSK2 |= (1 << OCIE2A);
+	
+	sei();
+}
+
+// called when TCNT2 overflows
+ISR(TIMER2_COMPA_vect){
+	//Perform action as OCR2A resets to 0
+	tot_overflow++;
+}
+
+void motor_forward(unsigned char voltage){
+	PORTB = (1 << PORTB0);
+	unsigned char pwm = voltage;//*255/12;
+	OCR2A = pwm;
+	TCCR2A = ((1<<COM2A0)|(1<<COM2A1)|(1 << WGM21)|(1 << WGM20));
+	PORTB |= (1 << PORTB3);
+	PORTB |= (1 << PORTB5);
+}
+
+void motor_reverse(unsigned char voltage){
+	PORTB = (1 << PORTB0);
+	unsigned char pwm = voltage;//*255/12;
+	OCR2A = pwm;
+	TCCR2A &= ~(1<<COM2A0);
+	TCCR2A = ((1<<COM2A1)|(1 << WGM21)|(1 << WGM20));
+	PORTB |= (1 << PORTB3);
+	PORTB &= ~(1 << PORTB5);
+}
+
+void motor_stop(void){
+	PORTB &= ~(1 << PORTB0);
+}
+
+// Enable Hall-effect sensor
+void Sensor_ENABLE(void){
+	// Specify the Port_1(DDC1) to in and Port_0(DDC0) to out: A1 and A0 are Port_C
+	DDRC = (1<<DDC0);	//0b0100000
+	// Set A0 as HIGH
+	PORTC = (1<<PORTC0);	//0b0100000
+}
+
+
+// Setup the ADC
+void adc_init(void){
+	ADCSRA |= ((1<<ADPS2)|(1<<ADPS1)|(1<<ADPS0));    // 16Mhz/128 = 125Khz the ADC reference clock
+	ADMUX |= (1<<REFS0);                // Voltage reference from Avcc (5v)
+	ADCSRA |= (1<<ADEN);                // Turn on ADC
+	ADCSRA |= (1<<ADSC);                // Do an initial conversion because this one is the slowest and to ensure that everything is up and running
+}
+
+
+// Read values from the sensor
+uint16_t read_adc(uint8_t channel){
+	ADMUX &= 0xF0;                  // Clear the older channel that was read
+	ADMUX |= channel;				// Defines the new ADC channel to be read
+	ADCSRA |= (1<<ADSC);            // Starts a new conversion
+	while(ADCSRA & (1<<ADSC));      // Wait until the conversion is done
+	return ADCW;                    // Returns the ADC value of the chosen channel
+}
+
+
+// Initialize USART
+void USART_init(void){
+	UBRR0H = (uint8_t)(BAUD_PRESCALLER>>8);
+	UBRR0L = (uint8_t)(BAUD_PRESCALLER);
+	UCSR0B = (1<<RXEN0)|(1<<TXEN0);
+	UCSR0C = (3<<UCSZ00);
+}
+
+
+// Send character from microcontroller to computer
+static void uart_putchar(char c){
+	//Loops until data register UDR0 is empty
+	while (!(UCSR0A & (1 << UDRE0))){
+		//Do Nothing
+	}
+	//Places the character in the UDR0 register
+	UDR0 = c;
+}
+
+
+// Send float from microcontroller to computer
+void printfloat(float number){
+	uint8_t *p = (uint8_t *)&number;
+	uart_putchar(p[0]);
+	uart_putchar(p[1]);
+	uart_putchar(p[2]);
+	uart_putchar(p[3]);
+}
+
+// Calibration equation to calculate angular position from voltage
+float calibrate(float volts) {
+	float degrees = volts*0.4417-49.863;
+	if (degrees>180) {
+		degrees=degrees-360;
+	}
+	return degrees;
+}
+
+// Handle discontinuous point in voltage/position
+float saturation(float angle) {
+	if (angle >= 180) {
+		angle = angle - 360;
+		} else if (angle <= -180) {
+		angle = angle + 360;
+	}
+	return angle;
+}
+
